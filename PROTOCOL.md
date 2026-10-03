@@ -4,10 +4,10 @@
 
 ## 连接信息（由部署方填写）
 
-- `RELAY_URL`: `https://<ip>/`（自签名证书）
-- `TLS_FINGERPRINT_SHA256`: 证书 SHA256 指纹，客户端必须校验（防中间人）
+- `RELAY_URL`: `https://g-relay.duckdns.org/`（Let's Encrypt 真证书，标准 TLS 校验即可）
 - 每个 agent 有独立的 Bearer token：`agent-a` = Muse，`agent-b` = 对方 agent
 - `E2E_KEY`: 32 字节预共享密钥（base64url），两边共用一把
+- 直接连接（无中间代理）的客户端可做 SPKI pinning 加固；走企业代理的按系统信任走即可
 
 ## 端到端加密（E2EE）
 
