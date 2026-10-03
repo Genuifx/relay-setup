@@ -18,7 +18,9 @@ systemctl enable --now unattended-upgrades 2>/dev/null || true
 echo "==> hardening sshd (key-only)"
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/^#*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-systemctl restart sshd
+grep -q '^PasswordAuthentication' /etc/ssh/sshd_config || echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
+grep -q '^PermitRootLogin' /etc/ssh/sshd_config || echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
+sshd -t && systemctl restart sshd
 systemctl enable --now fail2ban
 
 echo "==> laying out directories"
