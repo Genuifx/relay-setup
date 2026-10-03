@@ -246,8 +246,195 @@ p{font-size:13px;color:#9aa4b8;line-height:1.8}
 <body>
 <div class="card">
 <h1>登录成功</h1>
-<p>会话已建立，有效期 24 小时。<br>现在可以关闭此页面，<br>回到 agent 继续操作。</p>
+<p>会话已建立，有效期 24 小时。</p>
+<p><a href="/app" style="display:inline-block;margin-top:8px;padding:12px 28px;background:#3b82f6;color:#fff;border-radius:8px;text-decoration:none;font-size:15px">前往消息台 →</a></p>
+<p style="font-size:12px">在消息台粘贴 E2EE 密钥后，即可收发端到端加密消息。</p>
 </div></body></html>
+"""
+
+APP_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 消息台</title>
+<style>
+:root{--bg:#0f1420;--card:#1a2233;--line:#2c3a55;--txt:#e8ecf4;--dim:#9aa4b8;--acc:#3b82f6;--ok:#4ade80;--err:#f87171}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:16px;max-width:640px;margin-left:auto;margin-right:auto}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+header h1{font-size:18px;margin:0}
+header .who{font-size:12px;color:var(--dim);margin-top:4px}
+.card{background:var(--card);border-radius:12px;padding:16px;margin-bottom:16px}
+.card h2{font-size:14px;margin:0 0 12px;color:var(--dim);font-weight:600}
+label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+input,select,textarea{width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--txt);font-size:14px}
+textarea{min-height:90px;resize:vertical}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 16px;font-size:14px;cursor:pointer}
+button:hover{background:#2563eb}
+button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
+button.danger{background:transparent;border:1px solid var(--err);color:var(--err);padding:6px 12px;font-size:12px}
+.row{display:flex;gap:8px;align-items:center}
+.hint{font-size:12px;color:var(--dim);line-height:1.7;margin-top:8px}
+.msg{border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px}
+.msg .meta{font-size:12px;color:var(--dim);margin-bottom:6px}
+.msg .body{font-size:14px;white-space:pre-wrap;word-break:break-word}
+.msg .foot{margin-top:8px;text-align:right}
+.status{font-size:13px;min-height:20px;margin-top:8px}
+.status.ok{color:var(--ok)} .status.err{color:var(--err)}
+.keyrow{display:flex;gap:8px}
+.keyrow input{flex:1}
+.keyrow button{flex:0 0 auto}
+.badge{display:inline-block;font-size:11px;padding:2px 8px;border-radius:10px;background:#233252;color:var(--dim)}
+.badge.on{background:#14331f;color:var(--ok)}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Agent 消息台</h1><div class="who">已登录为 <b>{agent}</b> · 会话 24 小时有效</div></div>
+  <button class="ghost" id="logoutBtn">退出</button>
+</header>
+
+<div class="card">
+  <h2>端到端加密密钥 <span class="badge" id="keyBadge">未载入</span></h2>
+  <div class="keyrow">
+    <input id="e2eKey" type="password" placeholder="粘贴 E2EE 密钥" autocomplete="off">
+    <button id="loadKeyBtn">载入</button>
+  </div>
+  <div class="hint">密钥只保存在本浏览器标签页内，用于在本地加解密消息正文，绝不会发送到服务器。关闭标签页即清除。</div>
+</div>
+
+<div class="card">
+  <h2>发消息</h2>
+  <label>收件人</label>
+  <select id="toSel"><option value="agent-a">agent-a</option><option value="agent-b">agent-b</option><option value="broadcast">broadcast（所有人）</option></select>
+  <label>类型</label>
+  <input id="typeInp" value="note" maxlength="32">
+  <label>正文</label>
+  <textarea id="bodyInp" placeholder="输入消息正文，将在本地加密后发送"></textarea>
+  <div class="row" style="margin-top:10px"><button id="sendBtn">加密并发送</button></div>
+  <div class="status" id="sendStatus"></div>
+</div>
+
+<div class="card">
+  <h2>收件箱 <button class="ghost" id="refreshBtn" style="padding:6px 12px;font-size:12px;margin-left:8px">刷新</button></h2>
+  <div id="inbox"><div class="hint">点击刷新载入消息（每 30 秒自动刷新）。</div></div>
+</div>
+
+<script>
+"use strict";
+const AGENT = "{agent}";
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder(), dec = new TextDecoder();
+let cryptoKey = null;
+
+function b64ToBytes(b64url){
+  let b64 = b64url.trim().replace(/-/g,'+').replace(/_/g,'/');
+  while (b64.length % 4) b64 += '=';
+  const s = atob(b64), out = new Uint8Array(s.length);
+  for (let i=0;i<s.length;i++) out[i]=s.charCodeAt(i);
+  return out;
+}
+function bytesToB64(bytes){
+  let s=''; for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+async function importKey(b64url){
+  const raw = b64ToBytes(b64url);
+  if (raw.length !== 32) throw new Error('密钥长度应为 32 字节，实际 '+raw.length);
+  return crypto.subtle.importKey('raw', raw, {name:'AES-GCM'}, false, ['encrypt','decrypt']);
+}
+async function e2eEncrypt(key, to, type, body){
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const pt = enc.encode(JSON.stringify({v:1,from:AGENT,to:to,type:type,body:body,ts:Math.floor(Date.now()/1000)}));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv:nonce}, key, pt));
+  const wire = new Uint8Array(12+ct.length); wire.set(nonce); wire.set(ct,12);
+  return bytesToB64(wire);
+}
+async function e2eDecrypt(key, payloadB64){
+  const wire = b64ToBytes(payloadB64);
+  const pt = await crypto.subtle.decrypt({name:'AES-GCM',iv:wire.slice(0,12)}, key, wire.slice(12));
+  return JSON.parse(dec.decode(pt));
+}
+async function api(method, path, body){
+  const r = await fetch(path, {method:method, credentials:'include',
+    headers:{'Content-Type':'application/json'},
+    body: body!==undefined ? JSON.stringify(body) : undefined});
+  if (r.status===401){ location.href='/login'; throw new Error('会话已失效，请重新登录'); }
+  return r.json();
+}
+function setStatus(el, msg, ok){
+  el.textContent = msg;
+  el.className = 'status' + (ok===true ? ' ok' : ok===false ? ' err' : '');
+}
+async function loadKey(){
+  const v = $('e2eKey').value;
+  try{
+    cryptoKey = await importKey(v);
+    sessionStorage.setItem('e2e_key', v.trim());
+    $('keyBadge').textContent='已载入'; $('keyBadge').classList.add('on');
+    refreshInbox();
+  }catch(e){ setStatus($('sendStatus'), '密钥无效：'+e.message, false); }
+}
+async function refreshInbox(){
+  const box = $('inbox');
+  try{
+    const d = await api('GET','/v1/inbox?since=');
+    const msgs = d.messages || [];
+    if(!msgs.length){ box.innerHTML='<div class="hint">收件箱是空的。</div>'; return; }
+    box.innerHTML='';
+    for(const m of msgs){
+      const div=document.createElement('div'); div.className='msg';
+      const t=new Date(m.ts*1000).toLocaleString();
+      const meta=document.createElement('div'); meta.className='meta';
+      meta.textContent='来自 '+m.from+' · '+m.type+' · '+t;
+      div.appendChild(meta);
+      const bodyDiv=document.createElement('div'); bodyDiv.className='body';
+      if(cryptoKey){
+        try{ const p=await e2eDecrypt(cryptoKey, m.payload); bodyDiv.textContent=p.body||'(空正文)'; }
+        catch(e){ bodyDiv.innerHTML='<span class="badge">解密失败（密钥不匹配？）</span>'; }
+      }else{
+        bodyDiv.innerHTML='<span class="badge">载入密钥后解密查看</span>';
+      }
+      div.appendChild(bodyDiv);
+      const foot=document.createElement('div'); foot.className='foot';
+      const btn=document.createElement('button'); btn.className='danger'; btn.textContent='确认已读并删除';
+      btn.onclick=((mid)=>async()=>{ await api('POST','/v1/ack',{ids:[mid]}); refreshInbox(); })(m.id);
+      foot.appendChild(btn); div.appendChild(foot);
+      box.appendChild(div);
+    }
+  }catch(e){ box.innerHTML='<div class="hint">载入失败：'+String(e.message||e)+'</div>'; }
+}
+async function sendMsg(){
+  if(!cryptoKey){ setStatus($('sendStatus'),'请先载入 E2EE 密钥',false); return; }
+  const to=$('toSel').value, type=$('typeInp').value.trim()||'note', body=$('bodyInp').value;
+  if(!body.trim()){ setStatus($('sendStatus'),'正文不能为空',false); return; }
+  setStatus($('sendStatus'),'加密发送中…',null);
+  try{
+    const payload=await e2eEncrypt(cryptoKey,to,type,body);
+    const d=await api('POST','/v1/send',{to:to,type:type,payload:payload});
+    if(d.ok){ setStatus($('sendStatus'),'发送成功',true); $('bodyInp').value=''; }
+    else setStatus($('sendStatus'),'发送失败：'+(d.error||'未知错误'),false);
+  }catch(e){ setStatus($('sendStatus'),'发送失败：'+String(e.message||e),false); }
+}
+$('loadKeyBtn').onclick=loadKey;
+$('e2eKey').addEventListener('keydown',e=>{ if(e.key==='Enter') loadKey(); });
+$('sendBtn').onclick=sendMsg;
+$('refreshBtn').onclick=refreshInbox;
+$('logoutBtn').onclick=async()=>{
+  await fetch('/logout',{method:'POST',credentials:'include'});
+  sessionStorage.removeItem('e2e_key');
+  location.href='/login';
+};
+(function init(){
+  const saved=sessionStorage.getItem('e2e_key');
+  if(saved){ $('e2eKey').value=saved; loadKey(); }
+  refreshInbox();
+  setInterval(refreshInbox, 30000);
+})();
+</script>
+</body>
+</html>
 """
 
 
@@ -315,12 +502,49 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _redirect(self, loc):
+        self.send_response(302)
+        self.send_header("Location", loc)
+        self.end_headers()
+
+    def _serve_app(self, agent):
+        html = APP_HTML.replace("{agent}", agent)
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _logout(self):
+        sid = None
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            part = part.strip()
+            if part.startswith("relay_session="):
+                sid = part[len("relay_session="):]
+                break
+        if sid:
+            with _lock:
+                _sessions.pop(sid, None)
+                save_sessions()
+        self.send_response(302)
+        self.send_header("Location", "/login")
+        self.send_header(
+            "Set-Cookie",
+            "relay_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
+        self.end_headers()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
             return self._send(200, {"ok": True, "ts": int(time.time())})
         if parsed.path == "/login":
             return self._serve_login_page()
+        if parsed.path == "/app":
+            agent = get_session_agent(self.headers.get("Cookie"))
+            if not agent:
+                return self._redirect("/login")
+            return self._serve_app(agent)
         if parsed.path == "/v1/inbox":
             agent = self._auth()
             if not agent:
@@ -335,6 +559,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/logout":
+            return self._logout()
         if parsed.path == "/login":
             ip = self.client_address[0]
             if login_rate_limited(ip):
