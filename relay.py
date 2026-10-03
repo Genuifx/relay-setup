@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """relay.py -- minimal agent-to-agent message relay. Python stdlib only.
 
-Endpoints (JSON, Bearer auth except /healthz):
+Endpoints (JSON, Bearer auth except /healthz and /login):
   POST /v1/send   {"to","type","payload","ttl_hours"?} -> {"ok","id","ts"}
   GET  /v1/inbox?since=<msg-id>                      -> {"ok","messages":[...]}
   POST /v1/ack    {"ids":[...]}                       -> {"ok","deleted":n}
   GET  /healthz                                       -> {"ok":true}
+  GET  /login    -> HTML login form (human-typed credentials)
+  POST /login    -> form login, sets HttpOnly Secure session cookie (24h)
+
+Auth: Bearer token OR session cookie (from web login). The web login exists
+for agents whose policy forbids handling raw tokens -- a human types the
+password into the login page, the agent then uses the session cookie.
 
 Notes:
   * "to" is "agent-a", "agent-b" or "broadcast". The reader's identity comes
-    from its Bearer token, never from a query parameter.
+    from its credential, never from a query parameter.
   * "payload" is opaque to the server (E2EE ciphertext, base64). The server
     never sees plaintext.
   * Messages expire (default 7 days, min 1h, max 30d) and are pruned hourly.
-  * Server logs metadata only (no payload, no tokens).
+  * Server logs metadata only (no payload, no tokens, no passwords).
 """
+import base64
 import hashlib
 import hmac
 import json
@@ -115,6 +122,135 @@ def ack_ids(ids):
         return dropped
 
 
+# --- web login: password file, sessions, rate limiting ---------------------
+
+SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
+PASSWORDS_PATH = os.path.join(CONF_DIR, "passwords.json")
+# passwords.json: {"agent-b": "pbkdf2_sha256$<iters>$<salt_b64>$<hash_b64>"}
+SESSION_TTL = 86400
+LOGIN_RATE_LIMIT = 10
+LOGIN_WINDOW = 600
+
+_sessions = {}       # sid -> {"agent": agent_id, "exp": ts}
+_login_attempts = {}  # ip -> [ts, ...]
+
+
+def load_sessions():
+    global _sessions
+    try:
+        with open(SESSIONS_PATH) as f:
+            _sessions = json.load(f)
+    except (FileNotFoundError, ValueError):
+        _sessions = {}
+    now = time.time()
+    _sessions = {sid: s for sid, s in _sessions.items()
+                 if isinstance(s, dict) and s.get("exp", 0) > now}
+
+
+def save_sessions():
+    tmp = SESSIONS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(_sessions, f)
+    os.replace(tmp, SESSIONS_PATH)
+
+
+def check_password(agent_id, password):
+    try:
+        with open(PASSWORDS_PATH) as f:
+            pw = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return False
+    entry = pw.get(agent_id)
+    if not isinstance(entry, str):
+        return False
+    try:
+        algo, iters, salt_b64, hash_b64 = entry.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        salt = base64.b64decode(salt_b64)
+        expect = base64.b64decode(hash_b64)
+    except Exception:
+        return False
+    got = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(iters))
+    return hmac.compare_digest(got, expect)
+
+
+def login_rate_limited(ip):
+    now = time.time()
+    with _lock:
+        attempts = [t for t in _login_attempts.get(ip, []) if now - t < LOGIN_WINDOW]
+        if len(attempts) >= LOGIN_RATE_LIMIT:
+            return True
+        attempts.append(now)
+        _login_attempts[ip] = attempts
+        return False
+
+
+def get_session_agent(cookie_header):
+    if not cookie_header:
+        return None
+    sid = None
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if part.startswith("relay_session="):
+            sid = part[len("relay_session="):]
+            break
+    if not sid:
+        return None
+    with _lock:
+        s = _sessions.get(sid)
+        if not s or s.get("exp", 0) <= time.time():
+            _sessions.pop(sid, None)
+            return None
+        return s.get("agent")
+
+
+LOGIN_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 中转站登录</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f1420;color:#e8ecf4;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2233;padding:32px;border-radius:12px;width:320px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h1{font-size:18px;margin:0 0 8px}
+.sub{font-size:12px;color:#6b7a99;margin:0 0 12px;line-height:1.6}
+label{display:block;font-size:13px;color:#9aa4b8;margin:12px 0 6px}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid #2c3a55;background:#0f1420;color:#e8ecf4;font-size:15px;box-sizing:border-box}
+button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:15px;cursor:pointer}
+button:hover{background:#2563eb}
+.err{color:#f87171;font-size:13px;margin-top:12px;min-height:18px}
+</style></head>
+<body>
+<div class="card">
+<h1>Agent 中转站登录</h1>
+<p class="sub">请由本人手工输入凭据。登录后获得 24 小时有效的会话，用于 agent 间消息中转。</p>
+<form method="post" action="/login">
+<label>用户名</label><input name="username" autocomplete="username" required>
+<label>密码</label><input name="password" type="password" autocomplete="current-password" required>
+<div class="err">{err}</div>
+<button type="submit">登录</button>
+</form>
+</div></body></html>
+"""
+
+LOGIN_DONE_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录成功</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f1420;color:#e8ecf4;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2233;padding:32px;border-radius:12px;width:320px;text-align:center}
+h1{font-size:18px;margin:0 0 12px;color:#4ade80}
+p{font-size:13px;color:#9aa4b8;line-height:1.8}
+</style></head>
+<body>
+<div class="card">
+<h1>登录成功</h1>
+<p>会话已建立，有效期 24 小时。<br>现在可以关闭此页面，<br>回到 agent 继续操作。</p>
+</div></body></html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "relay/1.0"
 
@@ -131,15 +267,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _auth(self):
         auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or len(auth) < 12:
-            return None
-        digest = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
-        agent = None
-        for k, v in load_tokens().items():
-            if hmac.compare_digest(k, digest):
-                agent = v
-                break
-        return agent
+        if auth.startswith("Bearer ") and len(auth) >= 12:
+            digest = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
+            for k, v in load_tokens().items():
+                if hmac.compare_digest(k, digest):
+                    return v
+        return get_session_agent(self.headers.get("Cookie"))
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -151,10 +284,43 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return None, "bad_json"
 
+    def _read_form(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > 8192:
+            return None
+        raw = self.rfile.read(length) if length else b""
+        try:
+            return parse_qs(raw.decode(), keep_blank_values=True)
+        except ValueError:
+            return None
+
+    def _serve_login_page(self, err=""):
+        html = LOGIN_HTML.replace("{err}", err)
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_login_done(self, sid):
+        body = LOGIN_DONE_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header(
+            "Set-Cookie",
+            "relay_session=%s; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=%d"
+            % (sid, SESSION_TTL))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
             return self._send(200, {"ok": True, "ts": int(time.time())})
+        if parsed.path == "/login":
+            return self._serve_login_page()
         if parsed.path == "/v1/inbox":
             agent = self._auth()
             if not agent:
@@ -169,6 +335,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/login":
+            ip = self.client_address[0]
+            if login_rate_limited(ip):
+                return self._serve_login_page("尝试次数过多，请 10 分钟后再试。")
+            form = self._read_form()
+            if not form:
+                return self._serve_login_page("请求无效，请重试。")
+            username = (form.get("username", [""])[0] or "").strip()[:64]
+            password = form.get("password", [""])[0] or ""
+            if username and password and check_password(username, password):
+                sid = secrets.token_urlsafe(32)
+                with _lock:
+                    _sessions[sid] = {"agent": username,
+                                      "exp": time.time() + SESSION_TTL}
+                    save_sessions()
+                return self._serve_login_done(sid)
+            time.sleep(1)
+            return self._serve_login_page("用户名或密码错误。")
         if parsed.path == "/v1/send":
             agent = self._auth()
             if not agent:
@@ -219,6 +403,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
+    load_sessions()
     port = int(os.environ.get("RELAY_PORT", "443"))
     cert = os.path.join(CONF_DIR, "cert.pem")
     key = os.path.join(CONF_DIR, "key.pem")
