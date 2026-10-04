@@ -15,6 +15,7 @@ Config: ~/.config/relay-cli/config.json (0600), or $RELAY_CLI_CONFIG.
 import argparse
 import datetime
 import getpass
+import http.client
 import json
 import os
 import sys
@@ -156,14 +157,24 @@ def cmd_logout(args):
     store = TokenStore(args.config)
     server = args.server or store.server
     token = store.data.get("access_token")
-    if server and token:
+    revoke_error = None
+    if server and (token or store.data.get("refresh_token")):
         try:
+            if store.data.get("refresh_token"):
+                # Revocation still requires valid authentication. If access
+                # expired, rotate once and revoke the newly current pair.
+                token = get_valid_token(store, server, args.client_id)
             RelayClient(server, token).revoke_token(token)
             print("服务端令牌已吊销。")
-        except RelayError as e:
-            print("revoke failed (continuing): %s" % e, file=sys.stderr)
+        except (RelayError, RuntimeError, OSError, http.client.HTTPException) as e:
+            revoke_error = str(e)
+    elif token or store.data.get("refresh_token"):
+        revoke_error = "no server configured"
     store.clear_tokens()
     print("本地令牌已清除。")
+    if revoke_error:
+        raise RelayError("local tokens cleared; server revocation was not confirmed: "
+                         + revoke_error)
 
 
 def build_parser():

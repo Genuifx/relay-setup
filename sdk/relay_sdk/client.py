@@ -21,6 +21,10 @@ class RelayClient:
         self.timeout = timeout
 
     def _request(self, method, path, body=None, retries=3):
+        # Without server-side idempotency keys, a lost response to a write
+        # cannot tell us whether it took effect. Never replay it automatically.
+        if method.upper() not in ("GET", "HEAD", "OPTIONS"):
+            retries = 1
         target = urlparse(self.base_url)
         use_tls = target.scheme == "https"
         last = None
@@ -53,13 +57,17 @@ class RelayClient:
                 raise
             except Exception as e:
                 last = e
-                time.sleep(2 * (attempt + 1))
+                if attempt + 1 < retries:
+                    time.sleep(2 * (attempt + 1))
             finally:
                 if conn is not None:
                     try:
                         conn.close()
                     except Exception:
                         pass
+        if method.upper() == "POST" and path == "/v1/send":
+            raise RelayError("send response unavailable; message may have been accepted; "
+                             "check delivery before retrying: %r" % last)
         raise RelayError("request failed after %d attempts: %r" % (retries, last))
 
     def me(self):

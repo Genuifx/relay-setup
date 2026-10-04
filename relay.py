@@ -76,6 +76,12 @@ def _iter_messages():
 
 def prune(now=None):
     """Drop expired messages. Returns number dropped."""
+    with _lock:
+        return _prune_unlocked(now)
+
+
+def _prune_unlocked(now=None):
+    """Caller must hold _lock, including the background janitor."""
     now = now or time.time()
     kept, dropped = [], 0
     for line, m in _iter_messages():
@@ -94,14 +100,14 @@ def prune(now=None):
 
 def append_message(msg):
     with _lock:
-        prune()
+        _prune_unlocked()
         with open(STORE_PATH, "a") as f:
             f.write(json.dumps(msg, separators=(",", ":")) + "\n")
 
 
 def read_inbox(agent_id, since):
     with _lock:
-        prune()
+        _prune_unlocked()
         out = []
         for _, m in _iter_messages():
             if not isinstance(m, dict):
@@ -109,21 +115,31 @@ def read_inbox(agent_id, since):
             if m.get("id", "") <= since:
                 continue
             if m.get("to") in (agent_id, "broadcast"):
-                out.append(m)
+                if agent_id in m.get("_acked_by", []):
+                    continue
+                out.append({k: v for k, v in m.items() if k != "_acked_by"})
                 if len(out) >= PAGE_SIZE:
                     break
         return out
 
 
-def ack_ids(ids):
+def ack_ids(agent_id, ids):
+    """Acknowledge only this recipient's delivery; broadcast stays until TTL."""
     ids = set(ids)
     with _lock:
         kept, dropped = [], 0
         for line, m in _iter_messages():
             if isinstance(m, dict) and m.get("id") in ids:
-                dropped += 1
-            else:
-                kept.append(line)
+                if m.get("to") == agent_id:
+                    dropped += 1
+                    continue
+                if m.get("to") == "broadcast":
+                    acked = m.setdefault("_acked_by", [])
+                    if agent_id not in acked:
+                        acked.append(agent_id)
+                        dropped += 1
+                        line = json.dumps(m, separators=(",", ":"))
+            kept.append(line)
         tmp = STORE_PATH + ".tmp"
         with open(tmp, "w") as f:
             if kept:
@@ -213,24 +229,30 @@ def bearer_agent(token):
 
 
 def issue_token_pair(agent, client_id, scope):
+    with _lock:
+        d = load_oauth()
+        pair = _issue_token_pair(d, agent, client_id, scope)
+        save_oauth(d)
+        return pair
+
+
+def _issue_token_pair(d, agent, client_id, scope):
+    """Mutate the OAuth transaction held by the caller under _lock."""
     access = secrets.token_urlsafe(32)
     refresh = secrets.token_urlsafe(32)
     now = time.time()
-    with _lock:
-        d = load_oauth()
-        # drop any previous tokens for this (agent, client)
-        for store in ("access", "refresh"):
-            d[store] = {k: v for k, v in d[store].items()
-                        if not (v.get("agent") == agent and
-                                v.get("client_id") == client_id)}
-        ah = hashlib.sha256(access.encode()).hexdigest()
-        rh = hashlib.sha256(refresh.encode()).hexdigest()
-        d["access"][ah] = {"agent": agent, "exp": now + ACCESS_TOKEN_TTL,
-                           "client_id": client_id, "scope": scope}
-        d["refresh"][rh] = {"agent": agent, "exp": now + REFRESH_TOKEN_TTL,
-                            "client_id": client_id, "scope": scope,
-                            "access_hash": ah}
-        save_oauth(d)
+    # Preserve the existing one-active-pair-per-(agent, client) policy.
+    for store in ("access", "refresh"):
+        d[store] = {k: v for k, v in d[store].items()
+                    if not (v.get("agent") == agent and
+                            v.get("client_id") == client_id)}
+    ah = hashlib.sha256(access.encode()).hexdigest()
+    rh = hashlib.sha256(refresh.encode()).hexdigest()
+    d["access"][ah] = {"agent": agent, "exp": now + ACCESS_TOKEN_TTL,
+                       "client_id": client_id, "scope": scope}
+    d["refresh"][rh] = {"agent": agent, "exp": now + REFRESH_TOKEN_TTL,
+                        "client_id": client_id, "scope": scope,
+                        "access_hash": ah}
     return access, refresh
 
 
@@ -870,6 +892,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not v:
                     return self._oauth_error(400, "invalid_grant",
                                              "unknown device code")
+                if v.get("client_id") != client_id:
+                    return self._oauth_error(400, "invalid_grant")
                 if v.get("exp", 0) <= now:
                     del d["device"][dc]
                     save_oauth(d)
@@ -887,8 +911,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._oauth_error(400, "access_denied")
                 agent, scope = v["agent"], v.get("scope", "relay")
                 del d["device"][dc]
+                access, refresh = _issue_token_pair(d, agent, client_id, scope)
                 save_oauth(d)
-            access, refresh = issue_token_pair(agent, client_id, scope)
             return self._send(200, {"access_token": access,
                                     "token_type": "Bearer",
                                     "expires_in": ACCESS_TOKEN_TTL,
@@ -904,10 +928,12 @@ class Handler(BaseHTTPRequestHandler):
                     if hmac.compare_digest(k, rh):
                         v = vv
                         break
-            if not v or v.get("exp", 0) <= now:
-                return self._oauth_error(400, "invalid_grant")
-            access, refresh = issue_token_pair(v["agent"], client_id,
-                                               v.get("scope", "relay"))
+                if (not v or v.get("exp", 0) <= now or
+                        v.get("client_id") != client_id):
+                    return self._oauth_error(400, "invalid_grant")
+                access, refresh = _issue_token_pair(d, v["agent"], client_id,
+                                                   v.get("scope", "relay"))
+                save_oauth(d)
             return self._send(200, {"access_token": access,
                                     "token_type": "Bearer",
                                     "expires_in": ACCESS_TOKEN_TTL,
@@ -926,10 +952,25 @@ class Handler(BaseHTTPRequestHandler):
         digest = hashlib.sha256(token.encode()).hexdigest()
         with _lock:
             d = load_oauth()
-            for store in ("access", "refresh"):
-                for k, v in list(d[store].items()):
-                    if hmac.compare_digest(k, digest) and v.get("agent") == agent:
-                        del d[store][k]
+            access = d["access"].get(digest)
+            # Follow the pair's existing link, never all tokens for an agent.
+            # Reverse lookup also works after an expired access row is pruned.
+            for rh, refresh in list(d["refresh"].items()):
+                if refresh.get("agent") != agent:
+                    continue
+                linked = refresh.get("access_hash") == digest and (
+                    access is None or (access.get("agent") == agent and
+                    access.get("client_id") == refresh.get("client_id")))
+                if rh != digest and not linked:
+                    continue
+                ah = refresh.get("access_hash")
+                paired = d["access"].get(ah)
+                if (paired and paired.get("agent") == agent and
+                        paired.get("client_id") == refresh.get("client_id")):
+                    del d["access"][ah]
+                del d["refresh"][rh]
+            if access and access.get("agent") == agent:
+                d["access"].pop(digest, None)
             save_oauth(d)
         return self._send(200, {"ok": True})
 
@@ -1044,7 +1085,7 @@ class Handler(BaseHTTPRequestHandler):
             ids = req.get("ids", [])
             if not isinstance(ids, list):
                 return self._send(400, {"ok": False, "error": "bad_ids"})
-            n = ack_ids([str(i) for i in ids])
+            n = ack_ids(agent, [str(i) for i in ids])
             return self._send(200, {"ok": True, "deleted": n})
         return self._send(404, {"ok": False, "error": "not_found"})
 

@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import ssl
+import tempfile
 import time
 from urllib.parse import urlparse
 
@@ -36,11 +37,15 @@ class TokenStore:
         d = os.path.dirname(self.path)
         if d:
             os.makedirs(d, exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.data, f, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.path)
+        # mkstemp creates exclusively with mode 0600 before any secret is written.
+        fd, tmp = tempfile.mkstemp(prefix=".relay-config-", dir=d or ".")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.data, f, indent=2)
+            os.replace(tmp, self.path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
     def clear_tokens(self):
         for k in ("access_token", "refresh_token", "access_expires_at"):

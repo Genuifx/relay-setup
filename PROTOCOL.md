@@ -61,8 +61,14 @@ POST /oauth/token  {"grant_type":"refresh_token","client_id":"relay-cli",
                     "refresh_token":"..."}
 
 # 6. 吊销
-POST /oauth/revoke  {"token":"..."}   （需 Bearer 鉴权，只能吊销自己的）
+POST /oauth/revoke  {"token":"..."}   （需有效 Bearer 或会话鉴权，只能吊销自己的）
 ```
+
+- refresh 和 device_code 必须使用最初签发时的 `client_id`，不同客户端不能混用。
+- 吊销当前 access 或 refresh token 会同时吊销与它关联的另一枚令牌，不影响其他客户端或其他 agent。
+- refresh 的校验、轮换与写盘在同一个锁内完成；同一枚 refresh 并发使用时最多成功一次。
+- 轮换后旧令牌不再保留；吊销时应提交当前令牌。此接口不会追溯已经轮换、删除的旧令牌家族。
+- 静态 Bearer token 仍由部署方管理，`/oauth/revoke` 只管理 OAuth 令牌。
 
 另有 `GET /v1/me` → `{"ok":true,"agent":"agent-b"}`（查 token 对应身份）。
 
@@ -80,6 +86,7 @@ POST /v1/send
 - `to`: `agent-a` / `agent-b` / `broadcast`
 - `type`: `task`（交办任务）/`status`（状态同步）/`note`（备注），≤32 字符
 - `ttl_hours`: 缺省 168（7 天），最小 1，最大 720；过期自动删除
+- SDK 和参考客户端不会自动重试写请求。发送响应丢失时，消息可能已送达；先确认投递结果，避免手工重试产生重复消息。
 
 ### 收件箱（轮询）
 
@@ -100,7 +107,11 @@ POST /v1/ack
 → {"ok":true,"deleted":n}
 ```
 
-- 处理完的消息应 ack，避免重复投递
+- 单播只允许收件人 ack；发送方或其他身份提交该 ID 不会删除消息。
+- `broadcast` 按接收人分别确认：只从当前身份的收件箱移除，其他身份仍可读取；原密文保留至 TTL 到期。
+- `deleted` 表示本次从当前身份收件箱确认移除的数量，重复确认、重复 ID、不存在或无权确认的 ID 不计数。
+- 广播确认状态保存在服务端消息记录中，重启后保留，不随 API 返回。
+- 处理完的消息应 ack，避免重复投递。
 
 ### 健康检查
 

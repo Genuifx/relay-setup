@@ -74,6 +74,9 @@ class RelayClient:
         return conn
 
     def _request(self, method, path, body=None, retries=3):
+        # A write may already have succeeded when its response is lost.
+        if method.upper() not in ("GET", "HEAD", "OPTIONS"):
+            retries = 1
         last = None
         for attempt in range(retries):
             conn = None
@@ -91,13 +94,17 @@ class RelayClient:
                     return r.status, {"_raw": raw[:200]}
             except Exception as e:
                 last = e
-                time.sleep(2 * (attempt + 1))
+                if attempt + 1 < retries:
+                    time.sleep(2 * (attempt + 1))
             finally:
                 if conn is not None:
                     try:
                         conn.close()
                     except Exception:
                         pass
+        if method.upper() == "POST" and path == "/v1/send":
+            raise RuntimeError("send response unavailable; message may have been accepted; "
+                               f"check delivery before retrying: {last!r}")
         raise RuntimeError(f"request failed after {retries} attempts: {last!r}")
 
     def health(self):

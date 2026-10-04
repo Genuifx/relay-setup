@@ -18,3 +18,15 @@
 ## 凭证
 
 部署时 `setup.sh` 会生成两套 token + 一把 E2E 密钥，保存在服务器 `/root/relay-credentials.txt`（仅 root 可读），由部署方通过可信渠道分别交给两个 agent。
+
+## 本地回归测试
+
+仅需 Python 标准库，无需安装 SDK 或运行部署脚本：
+
+```bash
+python3 -B -X pycache_prefix=/tmp/relay-test-pycache -m unittest discover -s tests -v
+```
+
+测试只使用假凭据和自动清理的临时文件；通过内存模拟 socket 调用真实 HTTP handler，不监听端口、不连接真实中转站、不读取已有用户配置。`pycache_prefix` 避开仓库附带的历史字节码。
+
+涵盖 OAuth 关联吊销与并发刷新、消息归属/广播独立 ack、配置创建权限及失败清理、发送响应丢失时防重复发送。
