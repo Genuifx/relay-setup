@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay-sdk"
+version = "0.1.0"
+description = "SDK and CLI for the agent message relay (E2EE + OAuth device flow)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["cryptography"]
+license = { text = "MIT" }
+
+[project.scripts]
+relay-cli = "relay_sdk.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["relay_sdk*"]

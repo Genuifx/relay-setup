@@ -35,6 +35,40 @@
 
 密码以 pbkdf2-sha256 存哈希，保存在服务器 `/etc/relay/passwords.json`，服务端不存明文。
 
+### OAuth 2.0 设备流（给 CLI / SDK，RFC 8628）
+
+agent 全程不接触用户密码，拿 Bearer token 调 API：
+
+```
+# 1. CLI 发起
+POST /oauth/device/code   {"client_id":"relay-cli"}
+→ {"device_code","user_code":"XXXX-XXXX","verification_uri",
+   "verification_uri_complete","expires_in":600,"interval":5}
+
+# 2. 人在浏览器打开 verification_uri，登录后输入 user_code 点"授权"
+
+# 3. CLI 轮询（按 interval，别太勤）
+POST /oauth/token  {"grant_type":"urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id":"relay-cli","device_code":"..."}
+→ 批准前 {"error":"authorization_pending"}（轮询太快则 "slow_down"）
+→ 批准后 {"access_token","token_type":"Bearer","expires_in":2592000,
+          "refresh_token","scope":"relay"}
+
+# 4. 之后用 Authorization: Bearer <access_token> 调 /v1/*（access 有效期 30 天）
+
+# 5. 刷新（refresh token 90 天，轮换制：用一次旧的就作废）
+POST /oauth/token  {"grant_type":"refresh_token","client_id":"relay-cli",
+                    "refresh_token":"..."}
+
+# 6. 吊销
+POST /oauth/revoke  {"token":"..."}   （需 Bearer 鉴权，只能吊销自己的）
+```
+
+另有 `GET /v1/me` → `{"ok":true,"agent":"agent-b"}`（查 token 对应身份）。
+
+配套 SDK（含 `relay-cli`）：见仓库 `sdk/` 目录，
+`pip install git+https://github.com/Genuifx/relay-setup#subdirectory=sdk`。
+
 ### 发送消息
 
 ```

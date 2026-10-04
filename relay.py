@@ -8,6 +8,16 @@ Endpoints (JSON, Bearer auth except /healthz and /login):
   GET  /healthz                                       -> {"ok":true}
   GET  /login    -> HTML login form (human-typed credentials)
   POST /login    -> form login, sets HttpOnly Secure session cookie (24h)
+  GET  /app      -> web message desk (session required)
+  POST /logout   -> destroy session
+
+OAuth 2.0 Device Authorization Grant (RFC 8628) for CLI/SDK auth:
+  POST /oauth/device/code -> {device_code, user_code, verification_uri, ...}
+  GET  /oauth/device      -> user enters code + consent page (login required)
+  POST /oauth/token       -> device_code / refresh_token grants
+  POST /oauth/revoke      -> revoke an access/refresh token
+
+Auth: Bearer token (static or OAuth access) OR session cookie.
 
 Auth: Bearer token OR session cookie (from web login). The web login exists
 for agents whose policy forbids handling raw tokens -- a human types the
@@ -30,7 +40,7 @@ import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 CONF_DIR = os.environ.get("RELAY_CONF", "/etc/relay")
 DATA_DIR = os.environ.get("RELAY_DATA", "/var/lib/relay")
@@ -121,6 +131,158 @@ def ack_ids(ids):
         os.replace(tmp, STORE_PATH)
         return dropped
 
+
+# --- OAuth 2.0 Device Authorization Grant (RFC 8628) ---------------------------
+# Lets a CLI/SDK obtain a Bearer token without ever handling the user's
+# password: the CLI shows a user_code, the human authorizes it on the
+# /oauth/device web page (logged in via /login), the CLI polls /oauth/token.
+
+OAUTH_STORE = os.path.join(DATA_DIR, "oauth.json")
+OAUTH_CLIENTS = {"relay-cli": "relay CLI"}
+DEVICE_CODE_TTL = 600
+DEVICE_POLL_INTERVAL = 5
+ACCESS_TOKEN_TTL = 30 * 86400
+REFRESH_TOKEN_TTL = 90 * 86400
+USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789"  # no vowels, no 0/1
+
+
+def load_oauth():
+    try:
+        with open(OAUTH_STORE) as f:
+            d = json.load(f)
+    except (FileNotFoundError, ValueError):
+        d = {}
+    d.setdefault("device", {})
+    d.setdefault("access", {})
+    d.setdefault("refresh", {})
+    return d
+
+
+def save_oauth(d):
+    tmp = OAUTH_STORE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, OAUTH_STORE)
+
+
+def prune_oauth():
+    now = time.time()
+    with _lock:
+        d = load_oauth()
+        d["device"] = {k: v for k, v in d["device"].items()
+                       if v.get("exp", 0) > now}
+        d["access"] = {k: v for k, v in d["access"].items()
+                       if v.get("exp", 0) > now}
+        d["refresh"] = {k: v for k, v in d["refresh"].items()
+                        if v.get("exp", 0) > now}
+        save_oauth(d)
+
+
+def new_user_code():
+    return "-".join("".join(secrets.choice(USER_CODE_ALPHABET) for _ in range(4))
+                   for _ in range(2))
+
+
+def normalize_user_code(s):
+    return (s or "").strip().upper().replace(" ", "").replace("-", "")
+
+
+def valid_next(nxt):
+    return isinstance(nxt, str) and nxt.startswith("/") and not nxt.startswith("//")
+
+
+def public_base(handler):
+    override = os.environ.get("RELAY_PUBLIC_BASE")
+    if override:
+        return override.rstrip("/")
+    host = (handler.headers.get("Host") or "").split(":")[0] or "localhost"
+    return "https://%s" % host
+
+
+def bearer_agent(token):
+    """Return agent_id for a Bearer token (static tokens or OAuth access)."""
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    for k, v in load_tokens().items():
+        if hmac.compare_digest(k, digest):
+            return v
+    now = time.time()
+    for k, v in load_oauth()["access"].items():
+        if hmac.compare_digest(k, digest):
+            return v.get("agent") if v.get("exp", 0) > now else None
+    return None
+
+
+def issue_token_pair(agent, client_id, scope):
+    access = secrets.token_urlsafe(32)
+    refresh = secrets.token_urlsafe(32)
+    now = time.time()
+    with _lock:
+        d = load_oauth()
+        # drop any previous tokens for this (agent, client)
+        for store in ("access", "refresh"):
+            d[store] = {k: v for k, v in d[store].items()
+                        if not (v.get("agent") == agent and
+                                v.get("client_id") == client_id)}
+        ah = hashlib.sha256(access.encode()).hexdigest()
+        rh = hashlib.sha256(refresh.encode()).hexdigest()
+        d["access"][ah] = {"agent": agent, "exp": now + ACCESS_TOKEN_TTL,
+                           "client_id": client_id, "scope": scope}
+        d["refresh"][rh] = {"agent": agent, "exp": now + REFRESH_TOKEN_TTL,
+                            "client_id": client_id, "scope": scope,
+                            "access_hash": ah}
+        save_oauth(d)
+    return access, refresh
+
+
+DEVICE_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>设备授权</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f1420;color:#e8ecf4;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2233;padding:32px;border-radius:12px;width:340px;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h1{font-size:18px;margin:0 0 8px}
+.sub{font-size:12px;color:#6b7a99;margin:0 0 16px;line-height:1.7}
+label{display:block;font-size:13px;color:#9aa4b8;margin:12px 0 6px}
+input{width:100%;padding:12px;border-radius:8px;border:1px solid #2c3a55;background:#0f1420;color:#e8ecf4;font-size:20px;letter-spacing:4px;text-align:center;box-sizing:border-box;text-transform:uppercase}
+button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-size:15px;cursor:pointer}
+button:hover{background:#2563eb}
+button.deny{background:transparent;border:1px solid #f87171;color:#f87171;margin-top:10px}
+.err{color:#f87171;font-size:13px;margin-top:12px;min-height:18px}
+.code{font-size:28px;letter-spacing:6px;text-align:center;margin:12px 0;font-weight:700}
+.meta{font-size:13px;color:#9aa4b8;line-height:1.8}
+</style></head>
+<body>
+<div class="card">
+<h1>设备授权</h1>
+{body}
+</div></body></html>
+"""
+
+DEVICE_ENTRY_BODY = """
+<p class="sub">在你的 CLI / SDK 上看到一组 8 位代码？把它输在这里，授权该设备以你的身份访问中转站。</p>
+<form method="post" action="/oauth/device/verify">
+<label>设备代码</label><input name="user_code" placeholder="XXXX-XXXX" autocomplete="off" required>
+<div class="err">{err}</div>
+<button type="submit">下一步</button>
+</form>
+"""
+
+DEVICE_CONSENT_BODY = """
+<p class="sub">应用 <b>{client}</b> 请求以你的身份 <b>{agent}</b> 访问 agent 消息中转站（收发加密消息，有效期 30 天）。</p>
+<p class="meta">设备代码：<span class="code" style="font-size:18px">{user_code}</span></p>
+<form method="post" action="/oauth/device/authorize">
+<input type="hidden" name="device_code" value="{device_code}">
+<div class="err">{err}</div>
+<button type="submit" name="action" value="approve">授权</button>
+<button type="submit" class="deny" name="action" value="deny">拒绝</button>
+</form>
+"""
+
+DEVICE_DONE_BODY = """
+<p class="sub" style="font-size:15px;color:#4ade80">{msg}</p>
+<p class="sub">现在可以关闭此页面，回到你的 CLI 继续操作。</p>
+"""
 
 # --- web login: password file, sessions, rate limiting ---------------------
 
@@ -225,7 +387,7 @@ button:hover{background:#2563eb}
 <h1>Agent 中转站登录</h1>
 <p class="sub">请由本人手工输入凭据。登录后获得 24 小时有效的会话，用于 agent 间消息中转。</p>
 <form method="post" action="/login">
-<label>用户名</label><input name="username" autocomplete="username" required>
+{next_input}<label>用户名</label><input name="username" autocomplete="username" required>
 <label>密码</label><input name="password" type="password" autocomplete="current-password" required>
 <div class="err">{err}</div>
 <button type="submit">登录</button>
@@ -455,10 +617,9 @@ class Handler(BaseHTTPRequestHandler):
     def _auth(self):
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer ") and len(auth) >= 12:
-            digest = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
-            for k, v in load_tokens().items():
-                if hmac.compare_digest(k, digest):
-                    return v
+            agent = bearer_agent(auth[7:].strip())
+            if agent:
+                return agent
         return get_session_agent(self.headers.get("Cookie"))
 
     def _read_json(self):
@@ -481,8 +642,11 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return None
 
-    def _serve_login_page(self, err=""):
-        html = LOGIN_HTML.replace("{err}", err)
+    def _serve_login_page(self, err="", nxt=""):
+        nxt_input = ""
+        if nxt:
+            nxt_input = '<input type="hidden" name="next" value="%s">' % nxt.replace('"', "")
+        html = LOGIN_HTML.replace("{err}", err).replace("{next_input}", nxt_input)
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -490,7 +654,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_login_done(self, sid):
+    def _serve_login_done(self, sid, nxt=""):
+        if nxt:
+            self.send_response(302)
+            self.send_header("Location", nxt)
+            self.send_header(
+                "Set-Cookie",
+                "relay_session=%s; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=%d"
+                % (sid, SESSION_TTL))
+            self.end_headers()
+            return
         body = LOGIN_DONE_HTML.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -534,17 +707,246 @@ class Handler(BaseHTTPRequestHandler):
             "relay_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
         self.end_headers()
 
+    # --- OAuth device flow handlers --------------------------------------
+
+    def _oauth_error(self, status, error, description=""):
+        body = {"error": error}
+        if description:
+            body["error_description"] = description
+        return self._send(status, body)
+
+    def _device_page(self, body_html):
+        html = DEVICE_HTML.replace("{body}", body_html)
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_params(self):
+        """Accept JSON or form-encoded bodies, return a flat dict.
+
+        Reads the request body exactly once, then tries JSON first,
+        falling back to form parsing on the same bytes.
+        """
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length > 65536:
+            return {}
+        raw = self.rfile.read(length) if length else b""
+        try:
+            text = raw.decode()
+        except ValueError:
+            return {}
+        try:
+            d = json.loads(text or "{}")
+            if isinstance(d, dict):
+                return {k: (v[0] if isinstance(v, list) else v)
+                        for k, v in d.items()}
+        except ValueError:
+            pass
+        try:
+            form = parse_qs(text, keep_blank_values=True)
+        except ValueError:
+            return {}
+        return {k: v[0] for k, v in form.items() if v}
+
+    def _handle_device_code(self):
+        ip = self.client_address[0]
+        if login_rate_limited(ip):
+            return self._oauth_error(429, "slow_down", "too many requests")
+        params = self._read_params()
+        client_id = params.get("client_id", "")
+        if client_id not in OAUTH_CLIENTS:
+            return self._oauth_error(400, "invalid_client")
+        scope = str(params.get("scope", "relay"))[:64] or "relay"
+        device_code = secrets.token_urlsafe(32)
+        user_code = new_user_code()
+        now = time.time()
+        with _lock:
+            d = load_oauth()
+            d["device"][device_code] = {
+                "user_code": normalize_user_code(user_code),
+                "client_id": client_id, "scope": scope,
+                "exp": now + DEVICE_CODE_TTL, "status": "pending",
+                "agent": None, "last_poll": 0}
+            save_oauth(d)
+        base = public_base(self)
+        return self._send(200, {
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": base + "/oauth/device",
+            "verification_uri_complete":
+                base + "/oauth/device?code=" + quote(user_code, safe=""),
+            "expires_in": DEVICE_CODE_TTL,
+            "interval": DEVICE_POLL_INTERVAL,
+        })
+
+    def _handle_device_page(self, qs):
+        agent = get_session_agent(self.headers.get("Cookie"))
+        if not agent:
+            nxt = "/oauth/device"
+            code = (qs.get("code", [""])[0] or "").strip()
+            if code:
+                nxt += "?code=" + quote(code, safe="")
+            return self._redirect("/login?next=" + quote(nxt, safe=""))
+        code = normalize_user_code(qs.get("code", [""])[0])
+        if code:
+            now = time.time()
+            with _lock:
+                d = load_oauth()
+                match = [(dc, v) for dc, v in d["device"].items()
+                         if v.get("user_code") == code
+                         and v.get("status") == "pending"
+                         and v.get("exp", 0) > now]
+            if not match:
+                return self._device_page(
+                    DEVICE_ENTRY_BODY.replace("{err}", "代码无效或已过期，请重新输入。"))
+            dc, v = match[0]
+            uc = v["user_code"]
+            disp = uc[:4] + "-" + uc[4:]
+            body = DEVICE_CONSENT_BODY.replace(
+                "{client}", OAUTH_CLIENTS.get(v["client_id"], v["client_id"]))
+            body = body.replace("{agent}", agent).replace("{user_code}", disp)
+            body = body.replace("{device_code}", dc).replace("{err}", "")
+            return self._device_page(body)
+        return self._device_page(DEVICE_ENTRY_BODY.replace("{err}", ""))
+
+    def _handle_device_verify(self):
+        agent = get_session_agent(self.headers.get("Cookie"))
+        if not agent:
+            return self._redirect("/login?next=" + quote("/oauth/device", safe=""))
+        form = self._read_form() or {}
+        code = normalize_user_code((form.get("user_code") or [""])[0])
+        return self._redirect("/oauth/device?code=" + quote(code, safe=""))
+
+    def _handle_device_authorize(self):
+        agent = get_session_agent(self.headers.get("Cookie"))
+        if not agent:
+            return self._send(401, {"ok": False, "error": "unauthorized"})
+        form = self._read_form() or {}
+        dc = (form.get("device_code") or [""])[0]
+        action = (form.get("action") or [""])[0]
+        with _lock:
+            d = load_oauth()
+            v = d["device"].get(dc)
+            if not v or v.get("exp", 0) <= time.time():
+                d["device"].pop(dc, None)
+                save_oauth(d)
+                return self._device_page(DEVICE_DONE_BODY.replace(
+                    "{msg}", "该授权请求已过期，请让 CLI 重新发起。"))
+            if v.get("status") != "pending":
+                return self._device_page(DEVICE_DONE_BODY.replace(
+                    "{msg}", "该请求已处理过，无需重复操作。"))
+            if action == "approve":
+                v["status"] = "approved"
+                v["agent"] = agent
+                msg = "已授权 %s，CLI 将自动获得访问令牌。" % OAUTH_CLIENTS.get(
+                    v["client_id"], v["client_id"])
+            else:
+                v["status"] = "denied"
+                msg = "已拒绝授权，CLI 不会获得访问令牌。"
+            save_oauth(d)
+        return self._device_page(DEVICE_DONE_BODY.replace("{msg}", msg))
+
+    def _handle_token(self):
+        params = self._read_params()
+        grant = params.get("grant_type", "")
+        client_id = params.get("client_id", "")
+        if client_id not in OAUTH_CLIENTS:
+            return self._oauth_error(400, "invalid_client")
+        now = time.time()
+        if grant == "urn:ietf:params:oauth:grant-type:device_code":
+            dc = params.get("device_code", "")
+            with _lock:
+                d = load_oauth()
+                v = d["device"].get(dc)
+                if not v:
+                    return self._oauth_error(400, "invalid_grant",
+                                             "unknown device code")
+                if v.get("exp", 0) <= now:
+                    del d["device"][dc]
+                    save_oauth(d)
+                    return self._oauth_error(400, "expired_token")
+                if now - v.get("last_poll", 0) < DEVICE_POLL_INTERVAL:
+                    return self._oauth_error(400, "slow_down")
+                v["last_poll"] = now
+                save_oauth(d)
+                status = v.get("status")
+                if status == "pending":
+                    return self._oauth_error(400, "authorization_pending")
+                if status == "denied":
+                    del d["device"][dc]
+                    save_oauth(d)
+                    return self._oauth_error(400, "access_denied")
+                agent, scope = v["agent"], v.get("scope", "relay")
+                del d["device"][dc]
+                save_oauth(d)
+            access, refresh = issue_token_pair(agent, client_id, scope)
+            return self._send(200, {"access_token": access,
+                                    "token_type": "Bearer",
+                                    "expires_in": ACCESS_TOKEN_TTL,
+                                    "refresh_token": refresh,
+                                    "scope": scope})
+        if grant == "refresh_token":
+            rt = params.get("refresh_token", "")
+            rh = hashlib.sha256(rt.encode()).hexdigest()
+            with _lock:
+                d = load_oauth()
+                v = None
+                for k, vv in d["refresh"].items():
+                    if hmac.compare_digest(k, rh):
+                        v = vv
+                        break
+            if not v or v.get("exp", 0) <= now:
+                return self._oauth_error(400, "invalid_grant")
+            access, refresh = issue_token_pair(v["agent"], client_id,
+                                               v.get("scope", "relay"))
+            return self._send(200, {"access_token": access,
+                                    "token_type": "Bearer",
+                                    "expires_in": ACCESS_TOKEN_TTL,
+                                    "refresh_token": refresh,
+                                    "scope": v.get("scope", "relay")})
+        return self._oauth_error(400, "unsupported_grant_type")
+
+    def _handle_revoke(self):
+        agent = self._auth()
+        if not agent:
+            return self._send(401, {"ok": False, "error": "unauthorized"})
+        params = self._read_params()
+        token = params.get("token", "")
+        if not token:
+            return self._send(400, {"ok": False, "error": "bad_token"})
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        with _lock:
+            d = load_oauth()
+            for store in ("access", "refresh"):
+                for k, v in list(d[store].items()):
+                    if hmac.compare_digest(k, digest) and v.get("agent") == agent:
+                        del d[store][k]
+            save_oauth(d)
+        return self._send(200, {"ok": True})
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
             return self._send(200, {"ok": True, "ts": int(time.time())})
         if parsed.path == "/login":
-            return self._serve_login_page()
+            qs = parse_qs(parsed.query)
+            nxt = qs.get("next", [""])[0]
+            return self._serve_login_page(nxt=nxt if valid_next(nxt) else "")
+        if parsed.path == "/oauth/device":
+            return self._handle_device_page(parse_qs(parsed.query))
         if parsed.path == "/app":
             agent = get_session_agent(self.headers.get("Cookie"))
             if not agent:
                 return self._redirect("/login")
             return self._serve_app(agent)
+        if parsed.path == "/v1/me":
+            agent = self._auth()
+            if not agent:
+                return self._send(401, {"ok": False, "error": "unauthorized"})
+            return self._send(200, {"ok": True, "agent": agent})
         if parsed.path == "/v1/inbox":
             agent = self._auth()
             if not agent:
@@ -563,11 +965,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._logout()
         if parsed.path == "/login":
             ip = self.client_address[0]
-            if login_rate_limited(ip):
-                return self._serve_login_page("尝试次数过多，请 10 分钟后再试。")
             form = self._read_form()
+            nxt = ""
+            if form:
+                nxt = form.get("next", [""])[0] or ""
+            nxt = nxt if valid_next(nxt) else ""
+            if login_rate_limited(ip):
+                return self._serve_login_page("尝试次数过多，请 10 分钟后再试。", nxt)
             if not form:
-                return self._serve_login_page("请求无效，请重试。")
+                return self._serve_login_page("请求无效，请重试。", nxt)
             username = (form.get("username", [""])[0] or "").strip()[:64]
             password = form.get("password", [""])[0] or ""
             if username and password and check_password(username, password):
@@ -576,9 +982,19 @@ class Handler(BaseHTTPRequestHandler):
                     _sessions[sid] = {"agent": username,
                                       "exp": time.time() + SESSION_TTL}
                     save_sessions()
-                return self._serve_login_done(sid)
+                return self._serve_login_done(sid, nxt)
             time.sleep(1)
-            return self._serve_login_page("用户名或密码错误。")
+            return self._serve_login_page("用户名或密码错误。", nxt)
+        if parsed.path == "/oauth/device/code":
+            return self._handle_device_code()
+        if parsed.path == "/oauth/device/verify":
+            return self._handle_device_verify()
+        if parsed.path == "/oauth/device/authorize":
+            return self._handle_device_authorize()
+        if parsed.path == "/oauth/token":
+            return self._handle_token()
+        if parsed.path == "/oauth/revoke":
+            return self._handle_revoke()
         if parsed.path == "/v1/send":
             agent = self._auth()
             if not agent:
@@ -646,6 +1062,10 @@ def main():
             time.sleep(3600)
             try:
                 prune()
+            except Exception:
+                pass
+            try:
+                prune_oauth()
             except Exception:
                 pass
 
