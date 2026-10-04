@@ -601,6 +601,12 @@ $('logoutBtn').onclick=async()=>{
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Per-connection socket timeout: drops slowloris-style / half-open
+    # connections instead of leaking a handler thread forever. The service
+    # previously wedged (stopped accept()ing) twice in 12h; combined with the
+    # local healthcheck cron (see healthcheck.sh) it now self-heals.
+    timeout = 30
+
     server_version = "relay/1.0"
 
     def log_message(self, fmt, *args):  # metadata-only; stay silent

@@ -73,6 +73,17 @@ systemctl enable --now relay
 sleep 3
 systemctl is-active --quiet relay && echo "    relay service active"
 
+echo "==> installing local healthcheck watchdog (restarts relay if wedged)"
+curl -fsSL "${RELAY_PY_URL%relay.py}healthcheck.sh" -o /opt/relay/healthcheck.sh
+chmod 755 /opt/relay/healthcheck.sh
+cat > /etc/cron.d/relay-healthcheck <<'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root /opt/relay/healthcheck.sh
+EOF
+chmod 644 /etc/cron.d/relay-healthcheck
+echo "    healthcheck cron installed"
+
 PUBLIC_IP=$(curl -s --max-time 5 http://169.254.169.254/latest/meta-data/public-ipv4 || true)
 [ -z "$PUBLIC_IP" ] && PUBLIC_IP="<fill-public-ip>"
 
