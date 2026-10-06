@@ -34,6 +34,8 @@ Notes:
 import base64
 import hashlib
 import hmac
+import html
+import re
 import json
 import os
 import secrets
@@ -159,7 +161,47 @@ DEVICE_CODE_TTL = 600
 DEVICE_POLL_INTERVAL = 5
 ACCESS_TOKEN_TTL = 30 * 86400
 REFRESH_TOKEN_TTL = 90 * 86400
+KEY_HANDOFF_ALG = "RSA-OAEP-256"
+KEY_HANDOFF_BYTES = 384  # RSA-3072; only the 32-byte E2EE key is encrypted.
 USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ23456789"  # no vowels, no 0/1
+
+
+def validate_handoff_public_key(algorithm, encoded):
+    """Accept only a public RSA-3072 JWK, without server crypto dependencies."""
+    if algorithm != KEY_HANDOFF_ALG or not isinstance(encoded, str) or len(encoded) > 1024:
+        raise ValueError("invalid handoff key")
+    key = json.loads(encoded)
+    if not isinstance(key, dict) or set(key) != {"kty", "alg", "n", "e"}:
+        raise ValueError("invalid handoff key")
+    if key["kty"] != "RSA" or key["alg"] != KEY_HANDOFF_ALG or key["e"] != "AQAB":
+        raise ValueError("invalid handoff key")
+    n = key["n"]
+    if not isinstance(n, str) or not re.fullmatch(r"[A-Za-z0-9_-]{512}", n):
+        raise ValueError("invalid handoff key")
+    modulus = base64.b64decode(n, altchars=b"-_", validate=True)
+    if len(modulus) != KEY_HANDOFF_BYTES or modulus[0] < 128 or not modulus[-1] & 1:
+        raise ValueError("invalid handoff key")
+    return key
+
+
+def valid_handoff_ciphertext(value):
+    if not isinstance(value, str) or len(value) != 512:
+        return False
+    try:
+        raw = base64.b64decode(value, validate=True)
+        return len(raw) == KEY_HANDOFF_BYTES and base64.b64encode(raw).decode() == value
+    except ValueError:
+        return False
+
+
+def consent_token(session, device_code, client_id):
+    """Caller holds _lock. Bind approval to a session, request and identity."""
+    if "consent_secret" not in session:
+        session["consent_secret"] = secrets.token_urlsafe(32)
+        save_sessions()
+    context = json.dumps(["relay-device-consent-v1", device_code, client_id,
+                          session["agent"]], separators=(",", ":")).encode()
+    return hmac.new(session["consent_secret"].encode(), context, hashlib.sha256).hexdigest()
 
 
 def load_oauth():
@@ -292,13 +334,87 @@ DEVICE_ENTRY_BODY = """
 
 DEVICE_CONSENT_BODY = """
 <p class="sub">应用 <b>{client}</b> 请求以你的身份 <b>{agent}</b> 访问 agent 消息中转站（收发加密消息，有效期 30 天）。</p>
+<p class="sub">请核对代码与您自己刚发起的 CLI 完全一致；不要授权他人发来的代码。</p>
 <p class="meta">设备代码：<span class="code" style="font-size:18px">{user_code}</span></p>
-<form method="post" action="/oauth/device/authorize">
+<form id="consent-form" method="post" action="/oauth/device/authorize">
 <input type="hidden" name="device_code" value="{device_code}">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+{key_handoff}
 <div class="err">{err}</div>
-<button type="submit" name="action" value="approve">授权</button>
-<button type="submit" class="deny" name="action" value="deny">拒绝</button>
+<button id="approve-button" type="submit" name="action" value="approve">授权</button>
+<button type="submit" class="deny" name="action" value="deny" formnovalidate>拒绝</button>
 </form>
+"""
+
+# The plaintext input intentionally has NO name: even without JavaScript it
+# cannot be included in a native form POST. Only the encrypted envelope is sent.
+DEVICE_KEY_HANDOFF = """
+<label for="handoff-key">现有 E2EE 密钥</label>
+<input id="handoff-key" type="password" autocomplete="off" spellcheck="false"
+       style="text-transform:none;letter-spacing:normal" required>
+<p class="sub">授权会将此共享密钥加密交给该 CLI，并保存于它的本地配置。请仅向您信任的设备授权。</p>
+<input type="hidden" id="key-handoff" name="key_handoff" value="">
+<p id="handoff-error" class="err" role="alert"></p>
+<noscript>需要启用 JavaScript 和 Web Crypto 才能安全交接密钥；也可拒绝并使用旧的手动配置方式。</noscript>
+<script id="handoff-data" type="application/json">{handoff_data}</script>
+<script>
+async function encryptHandoffKey(value, data) {
+  const encoded = value.trim();
+  if (!/^[A-Za-z0-9_-]{43}=?$/.test(encoded)) throw new Error('invalid key');
+  const bytes = Uint8Array.from(atob(encoded.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+  if (bytes.length !== 32) throw new Error('invalid key');
+  const publicKey = await crypto.subtle.importKey('jwk', data.public_key,
+    {name: 'RSA-OAEP', hash: 'SHA-256'}, false, ['encrypt']);
+  try {
+    const ciphertext = await crypto.subtle.encrypt({name: 'RSA-OAEP',
+      label: new TextEncoder().encode(JSON.stringify(data.label))}, publicKey, bytes);
+    return btoa(String.fromCharCode(...new Uint8Array(ciphertext)));
+  } finally { bytes.fill(0); }
+}
+document.addEventListener('DOMContentLoaded', () => {
+const handoffForm = document.getElementById('consent-form');
+const handoffInput = document.getElementById('handoff-key');
+const handoffOutput = document.getElementById('key-handoff');
+const handoffError = document.getElementById('handoff-error');
+const approveButton = document.getElementById('approve-button');
+const handoffData = JSON.parse(document.getElementById('handoff-data').textContent);
+let handoffBusy = false;
+let handoffCancelled = false;
+handoffForm.addEventListener('submit', async event => {
+  if (event.submitter && event.submitter.value === 'deny') {
+    handoffCancelled = true;
+    handoffInput.value = '';
+    handoffOutput.value = '';
+    return;
+  }
+  event.preventDefault();
+  if (handoffBusy || handoffCancelled) return;
+  handoffBusy = true;
+  approveButton.disabled = true;
+  handoffError.textContent = '';
+  try {
+    if (!window.isSecureContext || !crypto.subtle) throw new Error('Web Crypto unavailable');
+    const value = handoffInput.value;
+    handoffInput.value = '';
+    const ciphertext = await encryptHandoffKey(value, handoffData);
+    if (handoffCancelled) return;
+    handoffOutput.value = ciphertext;
+    // Native submit() omits the submit button, so explicitly preserve approval.
+    const action = document.createElement('input');
+    action.type = 'hidden'; action.name = 'action'; action.value = 'approve';
+    handoffForm.appendChild(action);
+    handoffForm.submit();
+  } catch (_) {
+    handoffOutput.value = '';
+    handoffError.textContent = '无法加密密钥。请确认 HTTPS、浏览器支持 Web Crypto，并重新输入 32 字节 base64url 密钥。';
+    handoffBusy = false;
+    approveButton.disabled = false;
+  }
+});
+window.addEventListener('pagehide', () => { handoffCancelled = true; handoffInput.value = ''; handoffOutput.value = ''; });
+window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+});
+</script>
 """
 
 DEVICE_DONE_BODY = """
@@ -370,7 +486,7 @@ def login_rate_limited(ip):
         return False
 
 
-def get_session_agent(cookie_header):
+def session_id_from_cookie(cookie_header):
     if not cookie_header:
         return None
     sid = None
@@ -379,6 +495,11 @@ def get_session_agent(cookie_header):
         if part.startswith("relay_session="):
             sid = part[len("relay_session="):]
             break
+    return sid
+
+
+def get_session_agent(cookie_header):
+    sid = session_id_from_cookie(cookie_header)
     if not sid:
         return None
     with _lock:
@@ -638,6 +759,9 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj, separators=(",", ":")).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        if self.path.startswith("/oauth/"):
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -749,6 +873,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -787,6 +915,13 @@ class Handler(BaseHTTPRequestHandler):
         client_id = params.get("client_id", "")
         if client_id not in OAUTH_CLIENTS:
             return self._oauth_error(400, "invalid_client")
+        handoff_key = None
+        if "key_handoff_alg" in params or "key_handoff_public_key" in params:
+            try:
+                handoff_key = validate_handoff_public_key(
+                    params.get("key_handoff_alg"), params.get("key_handoff_public_key"))
+            except (ValueError, TypeError):
+                return self._oauth_error(400, "invalid_request", "invalid key handoff parameters")
         scope = str(params.get("scope", "relay"))[:64] or "relay"
         device_code = secrets.token_urlsafe(32)
         user_code = new_user_code()
@@ -798,6 +933,8 @@ class Handler(BaseHTTPRequestHandler):
                 "client_id": client_id, "scope": scope,
                 "exp": now + DEVICE_CODE_TTL, "status": "pending",
                 "agent": None, "last_poll": 0}
+            if handoff_key:
+                d["device"][device_code]["key_handoff_public_key"] = handoff_key
             save_oauth(d)
         base = public_base(self)
         return self._send(200, {
@@ -808,10 +945,12 @@ class Handler(BaseHTTPRequestHandler):
                 base + "/oauth/device?code=" + quote(user_code, safe=""),
             "expires_in": DEVICE_CODE_TTL,
             "interval": DEVICE_POLL_INTERVAL,
+            **({"key_handoff_alg": KEY_HANDOFF_ALG} if handoff_key else {}),
         })
 
     def _handle_device_page(self, qs):
-        agent = get_session_agent(self.headers.get("Cookie"))
+        cookie = self.headers.get("Cookie")
+        agent = get_session_agent(cookie)
         if not agent:
             nxt = "/oauth/device"
             code = (qs.get("code", [""])[0] or "").strip()
@@ -822,22 +961,36 @@ class Handler(BaseHTTPRequestHandler):
         if code:
             now = time.time()
             with _lock:
+                session = _sessions.get(session_id_from_cookie(cookie))
+                if not session or session.get("exp", 0) <= now:
+                    return self._send(401, {"error": "unauthorized"})
+                agent = session["agent"]
                 d = load_oauth()
                 match = [(dc, v) for dc, v in d["device"].items()
                          if v.get("user_code") == code
                          and v.get("status") == "pending"
                          and v.get("exp", 0) > now]
+                if match:
+                    dc, v = match[0]
+                    csrf = consent_token(session, dc, v["client_id"])
             if not match:
                 return self._device_page(
                     DEVICE_ENTRY_BODY.replace("{err}", "代码无效或已过期，请重新输入。"))
-            dc, v = match[0]
             uc = v["user_code"]
             disp = uc[:4] + "-" + uc[4:]
+            key_html = ""
+            if v.get("key_handoff_public_key"):
+                data = {"public_key": v["key_handoff_public_key"],
+                        "label": ["relay-e2ee-handoff-v1", dc, v["client_id"], agent]}
+                # Escaping '<' prevents a configured identity closing the script.
+                encoded = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+                key_html = DEVICE_KEY_HANDOFF.replace("{handoff_data}", encoded)
             body = DEVICE_CONSENT_BODY.replace(
-                "{client}", OAUTH_CLIENTS.get(v["client_id"], v["client_id"]))
-            body = body.replace("{agent}", agent).replace("{user_code}", disp)
-            body = body.replace("{device_code}", dc).replace("{err}", "")
-            return self._device_page(body)
+                "{client}", html.escape(OAUTH_CLIENTS.get(v["client_id"], v["client_id"])))
+            body = body.replace("{agent}", html.escape(agent)).replace("{user_code}", html.escape(disp))
+            body = body.replace("{device_code}", html.escape(dc, quote=True))
+            body = body.replace("{csrf_token}", csrf).replace("{err}", "")
+            return self._device_page(body.replace("{key_handoff}", key_html))
         return self._device_page(DEVICE_ENTRY_BODY.replace("{err}", ""))
 
     def _handle_device_verify(self):
@@ -849,13 +1002,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._redirect("/oauth/device?code=" + quote(code, safe=""))
 
     def _handle_device_authorize(self):
-        agent = get_session_agent(self.headers.get("Cookie"))
-        if not agent:
-            return self._send(401, {"ok": False, "error": "unauthorized"})
+        sid = session_id_from_cookie(self.headers.get("Cookie"))
         form = self._read_form() or {}
         dc = (form.get("device_code") or [""])[0]
         action = (form.get("action") or [""])[0]
         with _lock:
+            session = _sessions.get(sid)
+            if not session or session.get("exp", 0) <= time.time():
+                return self._send(401, {"error": "unauthorized"})
+            agent = session["agent"]
             d = load_oauth()
             v = d["device"].get(dc)
             if not v or v.get("exp", 0) <= time.time():
@@ -863,17 +1018,29 @@ class Handler(BaseHTTPRequestHandler):
                 save_oauth(d)
                 return self._device_page(DEVICE_DONE_BODY.replace(
                     "{msg}", "该授权请求已过期，请让 CLI 重新发起。"))
+            csrf = (form.get("csrf_token") or [""])[0]
+            if not hmac.compare_digest(csrf.encode(), consent_token(session, dc, v["client_id"]).encode()):
+                return self._send(403, {"error": "invalid_consent"})
             if v.get("status") != "pending":
                 return self._device_page(DEVICE_DONE_BODY.replace(
                     "{msg}", "该请求已处理过，无需重复操作。"))
+            if action not in ("approve", "deny"):
+                return self._send(400, {"error": "invalid_request"})
             if action == "approve":
+                if v.get("key_handoff_public_key"):
+                    ciphertext = (form.get("key_handoff") or [""])[0]
+                    if not valid_handoff_ciphertext(ciphertext):
+                        return self._send(400, {"error": "invalid_key_handoff"})
+                    v["key_handoff"] = {"alg": KEY_HANDOFF_ALG,
+                                        "ciphertext": ciphertext, "agent": agent}
                 v["status"] = "approved"
                 v["agent"] = agent
-                msg = "已授权 %s，CLI 将自动获得访问令牌。" % OAUTH_CLIENTS.get(
-                    v["client_id"], v["client_id"])
+                msg = "已授权 %s，CLI 将自动获得访问令牌%s。" % (
+                    html.escape(OAUTH_CLIENTS.get(v["client_id"], v["client_id"])),
+                    "和加密的 E2EE 密钥" if v.get("key_handoff") else "")
             else:
                 v["status"] = "denied"
-                msg = "已拒绝授权，CLI 不会获得访问令牌。"
+                msg = "已拒绝授权，CLI 不会获得访问令牌或密钥。"
             save_oauth(d)
         return self._device_page(DEVICE_DONE_BODY.replace("{msg}", msg))
 
@@ -883,10 +1050,10 @@ class Handler(BaseHTTPRequestHandler):
         client_id = params.get("client_id", "")
         if client_id not in OAUTH_CLIENTS:
             return self._oauth_error(400, "invalid_client")
-        now = time.time()
         if grant == "urn:ietf:params:oauth:grant-type:device_code":
             dc = params.get("device_code", "")
             with _lock:
+                now = time.time()
                 d = load_oauth()
                 v = d["device"].get(dc)
                 if not v:
@@ -917,11 +1084,14 @@ class Handler(BaseHTTPRequestHandler):
                                     "token_type": "Bearer",
                                     "expires_in": ACCESS_TOKEN_TTL,
                                     "refresh_token": refresh,
-                                    "scope": scope})
+                                    "scope": scope,
+                                    **({"key_handoff": v["key_handoff"]}
+                                       if v.get("key_handoff") else {})})
         if grant == "refresh_token":
             rt = params.get("refresh_token", "")
             rh = hashlib.sha256(rt.encode()).hexdigest()
             with _lock:
+                now = time.time()
                 d = load_oauth()
                 v = None
                 for k, vv in d["refresh"].items():

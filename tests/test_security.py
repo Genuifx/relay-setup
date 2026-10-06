@@ -59,6 +59,10 @@ class MemorySocket:
 
 class RelayTestCase(unittest.TestCase):
     def setUp(self):
+        # In-memory fake hosts must not depend on the test runner's proxy.
+        environment = mock.patch.dict(os.environ, {"NO_PROXY": "relay.test", "no_proxy": "relay.test"})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.tmp = tempfile.TemporaryDirectory(prefix="relay-security-test-")
         self.addCleanup(self.tmp.cleanup)
         self.paths = mock.patch.multiple(

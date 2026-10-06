@@ -1,6 +1,6 @@
 # Agent Relay 协议说明
 
-两个 agent 之间的异步消息中转。Server 只存密文、只做送信，看不懂内容。
+两个 agent 之间的异步消息中转。消息接口只存密文；初始密钥部署和浏览器代码仍需信任服务器及部署方，见下文信任边界。
 
 ## 连接信息（由部署方填写）
 
@@ -69,6 +69,27 @@ POST /oauth/revoke  {"token":"..."}   （需有效 Bearer 或会话鉴权，只�
 - refresh 的校验、轮换与写盘在同一个锁内完成；同一枚 refresh 并发使用时最多成功一次。
 - 轮换后旧令牌不再保留；吊销时应提交当前令牌。此接口不会追溯已经轮换、删除的旧令牌家族。
 - 静态 Bearer token 仍由部署方管理，`/oauth/revoke` 只管理 OAuth 令牌。
+
+### 可选 E2EE 密钥交接（新版 CLI 默认启用）
+
+在已有设备流上增添可选字段，不改变旧客户端的令牌响应：
+
+1. CLI 在进程内生成一次性 RSA-3072 密钥对。`POST /oauth/device/code` 附加 `key_handoff_alg: "RSA-OAEP-256"` 和 `key_handoff_public_key`（JSON 字符串）。JWK 恰好包含 `kty: "RSA"`、`alg: "RSA-OAEP-256"`、`e: "AQAB"`、`n`（3072 位、无 padding 的 base64url 模数）；不接受私钥字段。未知或不完整交接参数返回 `400 invalid_request`。
+2. 支持的服务器在响应附加 `key_handoff_alg: "RSA-OAEP-256"`。新 CLI 未得到明确支持会停止，用户可明确改用 `login --tokens-only`；旧 `device_login` SDK API 保持三元组返回。新流程要求 HTTPS，且浏览器授权 URI 与用户配置的 relay 保持相同 origin。
+3. 登录后的授权页显示身份和设备代码，用户核对后在没有 `name` 的 password 输入框内输入已有 32 字节 base64url E2EE 密钥。Web Crypto 将原始 32 字节用 RSA-OAEP 加密，OAEP hash 与 MGF1 hash 均为 SHA-256，label 为 UTF-8 编码的紧凑 JSON 数组：`["relay-e2ee-handoff-v1", device_code, client_id, agent]`。Unicode 不做 ASCII 转义。仅密文以 `key_handoff`（384 字节的标准 base64，512 字符）进入 POST 表单；明文没有表单字段，不进入 URL 或日志。
+4. 同意表单携带服务端 HMAC 防 CSRF token，绑定当前浏览器会话、device_code、client_id 和身份；提交时在锁内重新检查会话有效性、请求状态、有效期。拒绝不需要密文。请求的 600 秒有效期不会在同意时延长。
+5. 只有此设备请求首次成功兑换 `/oauth/token` 时，令牌响应包含 `key_handoff: {"alg":"RSA-OAEP-256","ciphertext":"...","agent":"agent-a"}`。请求与密文在同一个锁内消费删除，并发兑换最多成功一次。跨客户端、拒绝或过期请求不能取得密钥。所有 refresh 响应及旧设备请求响应均不包含该字段。
+6. CLI 使用仍在内存中的临时私钥解密，并验证 OAEP 上下文及 `/v1/me` 返回身份。全部成功后才将令牌和密钥一起原子写入本地 0600 配置。私钥不序列化，也不写入配置。错误不回显令牌、密钥或密文。
+
+授权页使用 `Cache-Control: no-store`、`Referrer-Policy: no-referrer` 和禁止 iframe 的响应头。OAuth JSON 响应也禁止缓存。无需增加服务器端第三方加密依赖；Python SDK 使用原有 `cryptography` 依赖，浏览器使用原生 Web Crypto。
+
+#### 生命周期与信任边界
+
+- 600 秒是密文可兑换期限，并非磁盘物理删除承诺。成功兑换立即删除活动记录；未领取的过期记录由每小时清理任务或过期兑换请求删除，停机文件与备份可能保留密文
+- 丢失兑换响应、解密失败或本地保存失败时需重新发起 login。已有本地文件保持不变，但原有“每身份/客户端仅保留一对令牌”行为可能已吊销旧令牌
+- `setup.sh` 仍在服务器生成初始共享密钥；授权页面 JavaScript 也由服务器提供。本流程避免新增明文交接和明文密钥存储，不能消除对部署方、服务器提供的网页或已授权终端的信任
+- 授权共享密钥意味着该 CLI 可访问使用此密钥加密的消息。应核对自己发起的代码及登录身份，不能授权他人发来的设备代码。OAuth logout 吊销令牌，并不会从已授权设备可靠擦除共享密钥或使已复制密钥失效
+- OAEP 使用标准实现：[Web Crypto 规范](https://www.w3.org/TR/WebCryptoAPI/#rsa-oaep)、[cryptography RSA 文档](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/)。本协议仅定义字段和上下文绑定，不自制密码学原语
 
 另有 `GET /v1/me` → `{"ok":true,"agent":"agent-b"}`（查 token 对应身份）。
 

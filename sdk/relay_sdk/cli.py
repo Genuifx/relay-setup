@@ -2,7 +2,7 @@
 """relay-cli -- command line interface for the agent message relay.
 
 Usage:
-  relay-cli login [--server URL]        OAuth device flow (browser approval)
+  relay-cli [--server URL] login [--tokens-only]  browser approval + key handoff
   relay-cli set-key                     save the E2EE key (typed by a human)
   relay-cli whoami
   relay-cli send --to agent-a --body "hi" [--type note]
@@ -21,7 +21,7 @@ import os
 import sys
 import time
 
-from .auth import TokenStore, device_login, get_valid_token, DEFAULT_CLIENT_ID
+from .auth import TokenStore, device_login, device_login_with_key, get_valid_token, DEFAULT_CLIENT_ID
 from .client import RelayClient, RelayError
 from .crypto import e2e_encrypt, e2e_decrypt
 
@@ -52,21 +52,31 @@ def get_e2e_key(args, store, required=True):
 def cmd_login(args):
     store = TokenStore(args.config)
     server = args.server or store.server or DEFAULT_SERVER
+    key = None
     try:
-        access, refresh, expires_in = device_login(server, args.client_id)
-    except RuntimeError as e:
+        if args.tokens_only:
+            access, refresh, expires_in = device_login(server, args.client_id)
+            agent = RelayClient(server, access).me()
+        else:
+            access, refresh, expires_in, key, agent = device_login_with_key(server, args.client_id)
+    except (RuntimeError, OSError, http.client.HTTPException) as e:
         die(str(e))
-    # whoami to record the agent identity
-    agent = RelayClient(server, access).me()
+    # No config mutation until decryption AND token identity verification succeed.
+    if args.tokens_only and (store.server != server or store.agent != agent):
+        store.data.pop("e2e_key", None)  # Never carry an unrelated server's key.
     store.data.update({
-        "server": server,
-        "agent": agent,
-        "access_token": access,
-        "refresh_token": refresh,
-        "access_expires_at": time.time() + expires_in,
+        "server": server, "agent": agent, "access_token": access,
+        "refresh_token": refresh, "access_expires_at": time.time() + expires_in,
     })
-    store.save()
-    print("已登录为 %s，令牌已保存。" % agent)
+    if key is not None:
+        store.data["e2e_key"] = key
+    try:
+        store.save()
+    except OSError:
+        die("配置保存失败；请重新 login。原配置文件未替换，旧令牌可能已被服务端轮换。")
+    print("已登录为 %s，令牌%s已保存。" % (agent, "和 E2EE 密钥" if key else ""))
+    if args.tokens_only:
+        print("仅更新令牌；E2EE 密钥未交接。如有需要，请运行 relay-cli set-key。")
 
 
 def cmd_set_key(args):
@@ -185,7 +195,9 @@ def build_parser():
     p.add_argument("--e2e-key", default=None, help="E2EE key (or $RELAY_E2E_KEY)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("login", help="OAuth device flow login")
+    s = sub.add_parser("login", help="OAuth login with browser E2EE key handoff")
+    s.add_argument("--tokens-only", action="store_true",
+                   help="legacy token-only login; configure the E2EE key separately")
     s.set_defaults(func=cmd_login)
 
     s = sub.add_parser("set-key", help="save the E2EE key locally")

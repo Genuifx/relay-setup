@@ -8,8 +8,8 @@ Submodules:
 """
 from .crypto import e2e_encrypt, e2e_decrypt
 from .client import RelayClient
-from .auth import TokenStore, device_login, get_valid_token
+from .auth import TokenStore, device_login, device_login_with_key, get_valid_token
 
 __all__ = ["e2e_encrypt", "e2e_decrypt", "RelayClient",
-           "TokenStore", "device_login", "get_valid_token"]
+           "TokenStore", "device_login", "device_login_with_key", "get_valid_token"]
 __version__ = "0.1.0"

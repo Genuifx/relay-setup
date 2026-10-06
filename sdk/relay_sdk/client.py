@@ -1,6 +1,6 @@
 """HTTPS JSON API client for the relay.
 
-Direct TLS with system CA verification. Pass a Bearer token (static token
+TLS with system CA verification and optional HTTPS_PROXY. Pass a Bearer token (static token
 or an OAuth access token from relay_sdk.auth).
 """
 import http.client
@@ -8,6 +8,7 @@ import json
 import ssl
 import time
 from urllib.parse import urlparse, quote
+from .transport import https_connection
 
 
 class RelayError(Exception):
@@ -32,10 +33,7 @@ class RelayClient:
             conn = None
             try:
                 if use_tls:
-                    ctx = ssl.create_default_context()
-                    conn = http.client.HTTPSConnection(
-                        target.hostname, target.port or 443,
-                        timeout=self.timeout, context=ctx)
+                    conn = https_connection(target, self.timeout)
                 else:
                     conn = http.client.HTTPConnection(
                         target.hostname, target.port or 80,
