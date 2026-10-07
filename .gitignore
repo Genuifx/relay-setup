@@ -10,3 +10,4 @@ relay-credentials.txt
 __pycache__/
 *.pyc
 config.json
+deploy-handoff.md
